@@ -267,6 +267,21 @@ function stats(doc, table) {
     if (mvp) out.awards.push({ key: 'mvp', icon: '⭐', title: `Round ${lastDone.n} MVPs`, ids: mvp.ids, value: `${mvp.f}–${mvp.a}`, sub: 'Best result last round' });
   }
 
+  // The Oracle: joined player with the best record picking winners.
+  const oracle = {};
+  for (const m of done) {
+    if (m.sa === m.sb) continue;
+    const win = m.sa > m.sb ? 'a' : 'b';
+    for (const [k, side] of Object.entries(m.picks || {})) {
+      if (!k.startsWith('p:')) continue;
+      const o = oracle[k] || (oracle[k] = { id: k.slice(2), right: 0, total: 0 });
+      o.total++; if (side === win) o.right++;
+    }
+  }
+  const orc = Object.values(oracle).filter((o) => o.total >= 2 && name[o.id])
+    .sort((a, b) => b.right - a.right || b.right / b.total - a.right / a.total)[0];
+  if (orc && orc.right > 0) out.awards.push({ key: 'oracle', icon: '🔮', title: 'The Oracle', ids: [orc.id], value: `${orc.right}/${orc.total} picks right`, sub: 'Best at calling winners' });
+
   for (const a of out.awards) a.names = a.ids.map((id) => name[id] || '?');
   return out;
 }

@@ -99,9 +99,13 @@
   const ST = () => Object.fromEntries((S?.standings || []).map((s) => [s.id, s]));
 
   // ---------- boot ----------
+  let es = null;
+  let lastPoll = 0;
+  let watching = 0;
   function boot() {
     route = parseRoute();
     clearInterval(pollTimer);
+    if (es) { es.close(); es = null; }
     S = null; lastStatus = null; seenRounds = null; ui.tab = null; ui.viewRound = null; ui.setup = null;
     closeModal();
     app.__html = null; app.__shell = false; app.__tv = false;
@@ -109,23 +113,65 @@
     app.innerHTML = '<div class="spin"></div>';
     app.__html = null;
     poll(true);
-    pollTimer = setInterval(() => { if (!document.hidden) poll(); }, 2500);
+    connectStream();
+    // The live stream does the real work; this is just a safety net if it drops.
+    pollTimer = setInterval(() => { if (!document.hidden && (!ui.live || Date.now() - lastPoll > 20000)) poll(); }, 2500);
+    if (route.view === 'tv') keepAwake();
   }
-  document.addEventListener('visibilitychange', () => { if (!document.hidden && route.id) poll(); });
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden || !route.id) return;
+    poll();
+    if (route.view === 'tv' || isAdmin()) keepAwake();
+  });
 
+  function connectStream() {
+    if (!window.EventSource || !route.id) return;
+    es = new EventSource(`/api/t/${route.id}/stream`);
+    es.onopen = () => { ui.live = true; };
+    es.onerror = () => { ui.live = false; };
+    es.onmessage = (ev) => {
+      let m;
+      try { m = JSON.parse(ev.data); } catch { return; }
+      if (m.t === 'v' && (!S || m.v !== S.version)) poll();
+      else if (m.t === 'r') floatReact(m);
+      else if (m.t === 'w') { watching = m.n; paintWatching(); }
+    };
+  }
+
+  let polling = null, pollAgain = false;
   async function poll(first = false) {
-    try {
-      const data = await api('GET', `/api/t/${route.id}/state?v=${S && !first ? S.version : ''}`);
-      if (!data) return;
-      const prev = S;
-      S = data;
-      onState(prev);
-    } catch (e) {
-      if (first) {
-        app.innerHTML = `<div class="wrap">${topBar()}<div class="card center" style="margin-top:40px"><h2>Couldn't find that tournament</h2><p class="muted">${esc(e.message)}</p><a class="btn primary" href="/">Start a new one</a></div></div>`;
-        clearInterval(pollTimer);
+    if (polling) { pollAgain = true; return polling; }
+    polling = (async () => {
+      try {
+        const data = await api('GET', `/api/t/${route.id}/state?v=${S && !first ? S.version : ''}`);
+        lastPoll = Date.now();
+        if (!data) return;
+        if (ui.pending) return; // taps in flight: don't flash stale scores, we re-poll once they land
+        const prev = S;
+        S = data;
+        onState(prev);
+      } catch (e) {
+        if (first) {
+          app.innerHTML = `<div class="wrap">${topBar()}<div class="card center" style="margin-top:40px"><h2>Couldn't find that tournament</h2><p class="muted">${esc(e.message)}</p><a class="btn primary" href="/">Start a new one</a></div></div>`;
+          clearInterval(pollTimer);
+          if (es) es.close();
+        }
       }
-    }
+    })();
+    await polling;
+    polling = null;
+    if (pollAgain) { pollAgain = false; return poll(); }
+  }
+
+  let wakeLock = null;
+  async function keepAwake() {
+    try { if (navigator.wakeLock && !wakeLock) { wakeLock = await navigator.wakeLock.request('screen'); wakeLock.addEventListener('release', () => { wakeLock = null; }); } } catch { /* not allowed */ }
+  }
+
+  function paintWatching() {
+    const el = $('#watching');
+    if (el) el.textContent = watching > 1 ? `👀 ${watching} watching` : '';
+    if (el) el.style.display = watching > 1 ? '' : 'none';
   }
 
   function onState(prev) {
@@ -142,18 +188,63 @@
 
     if (!ui.tab || lastStatus !== t.status) ui.tab = t.status === 'live' ? 'courts' : t.status === 'finished' ? 'podium' : 'squad';
 
+    // What changed since last time? Drives sounds, haptics and score bumps.
+    ui.bumped = new Set();
+    if (prev) {
+      const old = Object.fromEntries(prev.t.rounds.flatMap((r) => r.matches).map((m) => [m.id, m]));
+      let pts = 0, finals = 0;
+      for (const m of t.rounds.flatMap((r) => r.matches)) {
+        const o = old[m.id];
+        if (!o) continue;
+        if ((m.la || 0) !== (o.la || 0) || (m.lb || 0) !== (o.lb || 0)) { ui.bumped.add(m.id); pts++; }
+        if (m.done && !o.done) { ui.bumped.add(m.id); finals++; }
+      }
+      if (finals) sfx('win'); else if (pts) sfx('pt');
+    }
+
     // new round splash
     if (seenRounds !== null && t.rounds.length > seenRounds && t.status === 'live') {
       ui.viewRound = null;
       ui.tab = 'courts';
-      showSplash(t.rounds[t.rounds.length - 1]);
+      const r = t.rounds[t.rounds.length - 1];
+      showSplash(r);
+      sfx('round');
+      if (me() && r.matches.some((m) => [...m.a, ...m.b].includes(me().id))) buzz([30, 60, 30]);
     }
     // just finished
-    if (lastStatus === 'live' && t.status === 'finished') setTimeout(() => confetti(260), 300);
+    if (lastStatus === 'live' && t.status === 'finished') { setTimeout(() => confetti(260), 300); sfx('fanfare'); }
     seenRounds = t.rounds.length;
     lastStatus = t.status;
+    ui.prevPts = prev ? Object.fromEntries(prev.standings.map((s) => [s.id, s.points])) : null;
     render(prev);
+    paintWatching();
+    for (const id of ui.bumped) document.querySelectorAll(`[data-mscore="${id}"]`).forEach((el) => { el.classList.remove('bump'); void el.offsetWidth; el.classList.add('bump'); });
   }
+
+  // ---------- sound + haptics ----------
+  let actx = null;
+  const muted = () => !!LS.get('upt:mute');
+  function sfx(kind) {
+    if (muted() || document.hidden) return;
+    try {
+      actx = actx || new (window.AudioContext || window.webkitAudioContext)();
+      if (actx.state === 'suspended') return; // browsers only allow sound after a tap
+      const notes = { pt: [[880, 0, 0.07]], react: [[1320, 0, 0.05]], win: [[660, 0, 0.1], [880, 0.1, 0.1], [1320, 0.2, 0.18]], round: [[392, 0, 0.22], [523, 0.24, 0.35]], fanfare: [[523, 0, 0.15], [659, 0.15, 0.15], [784, 0.3, 0.15], [1047, 0.45, 0.5]] }[kind] || [];
+      const now = actx.currentTime;
+      for (const [f, at, dur] of notes) {
+        const o = actx.createOscillator(), g = actx.createGain();
+        o.type = kind === 'pt' || kind === 'react' ? 'sine' : 'triangle';
+        o.frequency.value = f;
+        g.gain.setValueAtTime(0.0001, now + at);
+        g.gain.exponentialRampToValueAtTime(0.18, now + at + 0.015);
+        g.gain.exponentialRampToValueAtTime(0.0001, now + at + dur);
+        o.connect(g).connect(actx.destination);
+        o.start(now + at); o.stop(now + at + dur + 0.05);
+      }
+    } catch { /* no audio */ }
+  }
+  document.addEventListener('pointerdown', () => { try { actx = actx || new (window.AudioContext || window.webkitAudioContext)(); if (actx.state === 'suspended') actx.resume(); } catch { /* ignore */ } }, { passive: true });
+  const buzz = (p = 12) => { try { navigator.vibrate?.(p); } catch { /* ignore */ } };
 
   // ---------- shared bits ----------
   function topBar(extra = '') {
@@ -281,11 +372,14 @@
         <div id="r-hero"></div>
         <div id="r-tabs"></div>
         <div id="r-main"></div>
-      </div>`;
+      </div>
+      <div id="r-react"></div>`;
       app.__shell = true;
       app.__html = null;
     }
+    setHTML($('#r-react'), t.status === 'lobby' ? '' : `<div class="react-bar" role="group" aria-label="Send a reaction">${REACTS.map((e) => `<button data-act="react" data-e="${e}" aria-label="React ${e}">${e}</button>`).join('')}</div>`);
     setHTML($('#r-top'), topBar(`
+      <button class="chip-btn icon" data-act="mute" aria-label="${muted() ? 'Sound off' : 'Sound on'}">${muted() ? '🔇' : '🔊'}</button>
       <a class="chip-btn" href="/t/${t.id}/tv" target="_blank" rel="noopener">📺 TV</a>
       ${isAdmin() ? '<button class="chip-btn on" data-act="lock">🔓 Organiser</button>' : '<button class="chip-btn" data-act="unlock">🔒 Organiser</button>'}`));
     setHTML($('#r-hero'), heroHTML());
@@ -303,7 +397,7 @@
     const venue = t.venue ? `<a href="https://maps.google.com/?q=${encodeURIComponent(t.venue)}" target="_blank" rel="noopener">📍 ${esc(t.venue)}</a>` : '';
     const stack = active.slice(0, 7).map((p) => `<img src="${photo(p)}" alt="">`).join('') + (active.length > 7 ? `<span class="more">+${active.length - 7}</span>` : '');
     return `<section class="hero">
-      <div class="badges">${status}<span class="badge">${fmtLabel(t)}</span><span class="badge">${ptsLabel(t)}</span></div>
+      <div class="badges">${status}<span class="badge">${fmtLabel(t)}</span><span class="badge">${ptsLabel(t)}</span>${t.status === 'lobby' && t.startUtc ? '<span class="badge cd" id="countdown"></span>' : ''}<span class="badge watch" id="watching" style="display:none"></span></div>
       <h1>${esc(t.name)}</h1>
       <div class="meta">${t.date ? `<span>📅 ${esc(fmtDate(t.date))}</span>` : ''}${t.time ? `<span>⏰ ${esc(fmtTime(t.time))}</span>` : ''}${venue}</div>
       <div class="hero-foot">
@@ -312,6 +406,16 @@
       </div>
     </section>`;
   }
+
+  // Ticking countdown to start time (updates text only, no re-render).
+  setInterval(() => {
+    const el = $('#countdown');
+    if (!el || !S?.t.startUtc) return;
+    const ms = new Date(S.t.startUtc).getTime() - Date.now();
+    if (ms <= 0) { el.textContent = '⏱ Starting now'; return; }
+    const d = Math.floor(ms / 864e5), h = Math.floor(ms / 36e5) % 24, m = Math.floor(ms / 6e4) % 60, s = Math.floor(ms / 1e3) % 60;
+    el.textContent = '⏱ ' + (d ? `${d}d ${h}h ${m}m` : h ? `${h}h ${m}m ${String(s).padStart(2, '0')}s` : `${m}:${String(s).padStart(2, '0')}`);
+  }, 1000);
 
   function gcalLink() {
     const t = S.t;
@@ -355,7 +459,49 @@
     else if (ui.tab === 'squad') html = squadHTML(true) + (t.status === 'live' && !me() ? `<div class="section-h"><h2>Late arrival?</h2></div>${joinHTML('Jump in from the next round')}` : '');
     else if (ui.tab === 'podium') html = podiumHTML() + `<div class="section-h"><h2>Awards</h2></div>${awardsHTML()}`;
     flip(main, () => setHTML(main, html));
+    countUp(main);
     void prev;
+  }
+
+  // Ladder points tick up to their new value.
+  function countUp(root) {
+    const old = ui.prevPts;
+    if (!old) return;
+    root.querySelectorAll('.lrow[data-pid] .pts').forEach((el) => {
+      const id = el.closest('.lrow').dataset.pid;
+      const to = +el.textContent, from = old[id];
+      if (from == null || from === to) return;
+      const t0 = performance.now(), dur = 900;
+      el.classList.add('ticking');
+      (function step(now) {
+        const k = Math.min(1, (now - t0) / dur);
+        el.textContent = Math.round(from + (to - from) * (1 - Math.pow(1 - k, 3)));
+        if (k < 1) requestAnimationFrame(step); else el.classList.remove('ticking');
+      })(t0);
+    });
+    ui.prevPts = null;
+  }
+
+  // ---------- reactions ----------
+  const REACTS = ['🔥', '👏', '😂', '😱', '💪', '🐐'];
+  let lastReactAt = 0;
+  async function sendReact(e) {
+    if (Date.now() - lastReactAt < 300) return;
+    lastReactAt = Date.now();
+    buzz(8);
+    if (!ui.live) floatReact({ e, n: '' });
+    try { await api('POST', `/api/t/${S.t.id}/react`, { e }); } catch { /* rate limited, fine */ }
+  }
+  function floatReact(m) {
+    sfx('react');
+    const el = document.createElement('div');
+    el.className = 'floater' + (route.view === 'tv' ? ' big' : '');
+    const pl = m.pid && P()[m.pid];
+    el.innerHTML = `<span class="fe">${esc(m.e)}</span>${pl ? `<img src="${photo(pl)}" alt="">` : ''}${m.n ? `<span class="fn">${esc(m.n)}</span>` : ''}`;
+    el.style.left = (route.view === 'tv' ? 8 + Math.random() * 84 : 55 + Math.random() * 35) + 'vw';
+    el.style.setProperty('--drift', (Math.random() * 80 - 40) + 'px');
+    document.body.appendChild(el);
+    setTimeout(() => el.remove(), 3200);
   }
 
   // ---------- Lobby ----------
@@ -411,7 +557,7 @@
       ${list.length ? `<div class="squad">${list.map((p) => {
         const s = st[p.id];
         const sub = withStats && s ? `${s.points} pts · ${s.w}W ${s.l}L` : (p.id === mid ? "That's you" : 'In');
-        return `<div class="pcard ${p.id === mid ? 'me' : ''} ${p.active ? '' : 'out'} ${now - p.joinedAt < 8000 ? 'new' : ''}">
+        return `<div class="pcard ${p.id === mid ? 'me' : ''} ${p.active ? '' : 'out'} ${now - p.joinedAt < 8000 ? 'new' : ''}" ${withStats ? `data-profile="${p.id}"` : ''}>
           ${isAdmin() && (t.status === 'lobby' || p.active) ? `<button class="x" data-act="remove" data-pid="${p.id}" aria-label="Remove ${esc(p.name)}">×</button>` : ''}
           <img class="photo" src="${photo(p)}" alt="" loading="lazy">
           <div class="nm">${esc(p.name)} ${streakTag(s)}</div>
@@ -452,26 +598,114 @@
   // ---------- Courts ----------
   function teamHTML(ids, side, m) {
     const pl = P(), st = ST();
-    const done = m.done;
-    const mine = side === 'a' ? m.sa : m.sb;
-    const theirs = side === 'a' ? m.sb : m.sa;
-    const cls = done ? (mine > theirs ? 'win' : mine < theirs ? 'lose' : '') : '';
+    const a = side === 'a';
+    const mine = m.done ? (a ? m.sa : m.sb) : (a ? m.la : m.lb) || 0;
+    const theirs = m.done ? (a ? m.sb : m.sa) : (a ? m.lb : m.la) || 0;
+    const cls = m.done ? (mine > theirs ? 'win' : mine < theirs ? 'lose' : '') : (mine > theirs ? 'lead' : '');
     return `<div class="team ${side} ${cls}">
-      <div class="duo">${ids.map((id) => `<span class="pw">${img(pl[id], '')}${st[id]?.streak >= 3 ? '<span class="fire">🔥</span>' : ''}</span>`).join('')}</div>
+      <div class="duo">${ids.map((id) => `<span class="pw" data-profile="${id}">${img(pl[id], '')}${st[id]?.streak >= 3 ? '<span class="fire">🔥</span>' : ''}</span>`).join('')}</div>
       <div class="names">${ids.map((id) => `<div>${esc(pl[id]?.name || '?')}</div>`).join('')}</div>
     </div>`;
   }
 
-  function courtHTML(m, admin, i = 0) {
+  // Current run of unanswered points, e.g. 5-0.
+  function runOf(m) {
+    const s = m.seq || '';
+    if (!s) return null;
+    const side = s[s.length - 1];
+    let n = 0;
+    for (let i = s.length - 1; i >= 0 && s[i] === side; i--) n++;
+    return n >= 3 ? { side, n } : null;
+  }
+
+  const myPicks = () => (route.id && LS.get('upt:picks:' + route.id)) || {};
+  function voterId() {
+    let v = LS.get('upt:voter');
+    if (!v) { v = Math.random().toString(36).slice(2) + Date.now().toString(36); LS.set('upt:voter', v); }
+    return v;
+  }
+
+  function picksHTML(m, open) {
+    const p = m.picks || { a: 0, b: 0 };
+    const tot = p.a + p.b;
+    const mine = myPicks()[m.id];
+    const pa = tot ? Math.round((p.a / tot) * 100) : 50;
+    if (open) {
+      return `<div class="picks">
+        <button class="pick a ${mine === 'a' ? 'on' : ''}" data-act="pick" data-mid="${m.id}" data-side="a">${mine === 'a' ? '✓ Backed' : 'Back'}</button>
+        <div class="pick-mid">${tot ? `<div class="pickbar"><i style="width:${pa}%"></i></div><span>${pa}% · ${100 - pa}%</span>` : '<span>Who wins? 🤔</span>'}</div>
+        <button class="pick b ${mine === 'b' ? 'on' : ''}" data-act="pick" data-mid="${m.id}" data-side="b">${mine === 'b' ? '✓ Backed' : 'Back'}</button>
+      </div>`;
+    }
+    if (!tot && !mine) return '';
+    let verdict = '';
+    if (m.done && mine && m.sa !== m.sb) verdict = (m.sa > m.sb ? 'a' : 'b') === mine ? ' · ✅ You called it' : ' · ❌ Not your night';
+    return `<div class="picks locked"><div class="pick-mid"><div class="pickbar"><i style="width:${pa}%"></i></div><span>Crowd: ${pa}% · ${100 - pa}%${verdict}</span></div></div>`;
+  }
+
+  function courtHTML(m, admin, i = 0, opts = {}) {
+    const t = S.t;
     const mid = me()?.id;
     const mineMatch = mid && [...m.a, ...m.b].includes(mid);
-    const score = m.done
-      ? `<div class="score"><span class="${m.sa >= m.sb ? 'w' : 'l'}">${m.sa}</span><span class="sep">:</span><span class="${m.sb >= m.sa ? 'w' : 'l'}">${m.sb}</span></div>`
-      : '<div class="vs">VS</div>';
-    return `<div class="court ${m.done ? 'done' : ''}" style="animation-delay:${0.15 + i * 0.12}s">
-      <div class="court-h"><span>Court ${m.court}${mineMatch ? ' · <span style="color:var(--ball)">You</span>' : ''}</span><span class="st ${m.done ? 'fin' : ''}">${m.done ? 'Final' : '● Playing'}</span></div>
-      <div class="teams">${teamHTML(m.a, 'a', m)}<div class="mid">${score}</div>${teamHTML(m.b, 'b', m)}</div>
-      ${admin ? `<div class="act"><button class="btn block ${m.done ? 'small ghost' : 'primary'}" data-act="score" data-mid="${m.id}">${m.done ? 'Edit score' : 'Enter score'}</button></div>` : ''}
+    const la = m.la || 0, lb = m.lb || 0;
+    const live = !m.done && la + lb > 0;
+    const timed = t.scoring === 'time';
+    const full = !timed && la + lb >= t.points;
+    let score;
+    if (m.done) score = `<div class="score" data-mscore="${m.id}"><span class="${m.sa >= m.sb ? 'w' : 'l'}">${m.sa}</span><span class="sep">:</span><span class="${m.sb >= m.sa ? 'w' : 'l'}">${m.sb}</span></div>`;
+    else if (live) score = `<div class="score live" data-mscore="${m.id}"><span>${la}</span><span class="sep">:</span><span>${lb}</span></div>`;
+    else score = '<div class="vs">VS</div>';
+    const run = !m.done ? runOf(m) : null;
+    const state = m.done ? '<span class="st fin">Final</span>' : live ? '<span class="st live">● Live</span>' : '<span class="st">On court</span>';
+    const bar = !timed && (live || m.done) ? `<div class="pbar"><i class="a" style="width:${((m.done ? m.sa : la) / t.points) * 100}%"></i><i class="b" style="width:${((m.done ? m.sb : lb) / t.points) * 100}%"></i></div>` : '';
+    const canPick = t.status === 'live' && !m.done && !live && !opts.noPicks && !opts.tv;
+    let act = '';
+    if (admin && !m.done && t.status === 'live') {
+      act = `<div class="live-pad">
+          <button class="tap a" data-act="pt" data-mid="${m.id}" data-side="a" ${full ? 'disabled' : ''}>+1</button>
+          <button class="undo" data-act="unpt" data-mid="${m.id}" ${la + lb ? '' : 'disabled'} aria-label="Undo last point">↩</button>
+          <button class="tap b" data-act="pt" data-mid="${m.id}" data-side="b" ${full ? 'disabled' : ''}>+1</button>
+        </div>
+        ${full || (timed && live) ? `<button class="btn primary block confirm" data-act="confirm" data-mid="${m.id}">✓ Confirm ${la}–${lb}</button>` : ''}
+        <button class="btn small ghost block" data-act="score" data-mid="${m.id}">Type the final score</button>`;
+    } else if (admin) {
+      act = `<button class="btn small ghost block" data-act="score" data-mid="${m.id}">Edit score</button>`;
+    }
+    return `<div class="court ${m.done ? 'done' : ''} ${live ? 'is-live' : ''} ${mineMatch ? 'mine' : ''}" style="animation-delay:${0.15 + i * 0.12}s">
+      <div class="court-h"><span>Court ${m.court}${mineMatch ? ' · <span class="you">You</span>' : ''}</span>${state}</div>
+      <div class="teams">${teamHTML(m.a, 'a', m)}<div class="mid">${score}${run ? `<div class="run ${run.side}">🔥 ${run.n}-0 run</div>` : ''}</div>${teamHTML(m.b, 'b', m)}</div>
+      ${bar}
+      ${opts.noPicks ? '' : picksHTML(m, canPick)}
+      ${act ? `<div class="act">${act}</div>` : ''}
+    </div>`;
+  }
+
+  // "You're on Court 2" card for players.
+  function myMatchHTML(r) {
+    const id = me()?.id;
+    if (!id || S.t.status !== 'live') return '';
+    const pl = P();
+    const m = r.matches.find((x) => [...x.a, ...x.b].includes(id));
+    if (!m) {
+      if (!(r.byes || []).includes(id)) return '';
+      return `<div class="mine-card sit"><span class="big-ic">☕</span><div><b>You're sitting this one out</b><div class="muted">${S.t.byePoints ? `You'll bank ${S.t.scoring === 'time' ? 'the round average' : Math.floor(S.t.points / 2) + ' points'} for it.` : 'Grab a drink, back next round.'}</div></div></div>`;
+    }
+    const mySide = m.a.includes(id) ? 'a' : 'b';
+    const mates = (mySide === 'a' ? m.a : m.b).filter((x) => x !== id);
+    const opp = mySide === 'a' ? m.b : m.a;
+    let status = '';
+    if (m.done) {
+      const us = mySide === 'a' ? m.sa : m.sb, them = mySide === 'a' ? m.sb : m.sa;
+      status = us > them ? `Won ${us}–${them} 🎉` : us < them ? `Lost ${us}–${them}` : `Drew ${us}–${them}`;
+    } else if ((m.la || 0) + (m.lb || 0)) {
+      const us = mySide === 'a' ? m.la : m.lb, them = mySide === 'a' ? m.lb : m.la;
+      status = `Live: ${us}–${them}${us > them ? ' 💪' : ''}`;
+    }
+    return `<div class="mine-card">
+      <div class="mc-court">Court<b>${m.court}</b></div>
+      <div class="mc-body"><div class="mc-line">You + ${mates.map((x) => `<span class="chip">${img(pl[x], '')}${esc(pl[x]?.name)}</span>`).join('')}</div>
+        <div class="mc-line"><span class="muted">vs</span> ${opp.map((x) => `<span class="chip">${img(pl[x], '')}${esc(pl[x]?.name)}</span>`).join('')}</div>
+        ${status ? `<div class="mc-status">${status}</div>` : ''}</div>
     </div>`;
   }
 
@@ -502,6 +736,7 @@
         <h2>Round <span>${r.n}</span>${isLatest && t.status === 'live' ? '' : ` <small class="muted" style="font-size:20px">of ${t.rounds.length}</small>`}</h2>
         ${t.rounds.length > 1 ? `<div class="round-nav"><button class="btn small" data-act="round" data-d="-1" ${idx === 0 ? 'disabled' : ''}>←</button><button class="btn small" data-act="round" data-d="1" ${isLatest ? 'disabled' : ''}>→</button></div>` : ''}
       </div>
+      ${isLatest ? myMatchHTML(r) : ''}
       <div class="courts">${r.matches.map((m) => courtHTML(m, admin || (isAdmin() && t.status === 'finished'))).join('')}</div>
       ${byes.length ? `<div class="byes">☕ Sitting out: ${byes.map((p) => `<span class="pill"><img src="${photo(p)}" alt="">${esc(p.name)}</span>`).join('')}</div>` : ''}
       ${ctrl}
@@ -520,7 +755,7 @@
         const p = pl[s.id];
         const mv = s.move > 0 ? `<span class="mv up">▲${s.move}</span>` : s.move < 0 ? `<span class="mv down">▼${-s.move}</span>` : '<span class="mv">–</span>';
         const hot = s.streak >= 3;
-        return `<div class="lrow ${s.rank <= 3 ? 'p' + s.rank : ''} ${s.id === mid ? 'me' : ''}" data-pid="${s.id}">
+        return `<div class="lrow ${s.rank <= 3 ? 'p' + s.rank : ''} ${s.id === mid ? 'me' : ''}" data-pid="${s.id}" data-profile="${s.id}">
           <span class="rk">${s.rank}</span>${mv}
           ${hot ? `<span class="av-ring hot"><img class="av" src="${photo(p)}" alt="" style="width:42px;height:42px"></span>` : img(p)}
           <div class="who"><div class="nm"><span>${esc(s.name)}</span>${streakTag(s)}${s.active ? '' : '<span class="tag out">Left</span>'}</div>
@@ -575,15 +810,209 @@
         <div class="total"><b>${rounds}</b><span>Rounds</span></div>
       </div>
       ${awardsHTML()}
-      <div class="section-h"><h2>Player stats</h2></div>
+      ${raceHTML()}
+      <div class="section-h"><h2>Player stats</h2><span class="aside">Tap a name for their story</span></div>
       <div class="tbl-wrap"><table class="stats">
         <thead><tr><th>Player</th><th>P</th><th>W</th><th>D</th><th>L</th><th>For</th><th>Agst</th><th>+/−</th><th>Win %</th><th>Avg</th><th>Best run</th><th>Pts</th></tr></thead>
         <tbody>${rows.map((s) => `<tr>
-          <td><span class="pl">${img(pl[s.id], '')}${esc(s.name)} ${streakTag(s)}</span></td>
+          <td><span class="pl" data-profile="${s.id}">${img(pl[s.id], '')}${esc(s.name)} ${streakTag(s)}</span></td>
           <td>${s.played}</td><td>${s.w}</td><td>${s.d}</td><td>${s.l}</td><td>${s.pf}</td><td>${s.pa}</td>
           <td>${s.diff > 0 ? '+' : ''}${s.diff}</td><td>${s.winPct}%</td><td>${s.avg}</td><td>${s.bestStreak ? s.bestStreak + 'W' : '–'}</td>
           <td class="big">${s.points}</td></tr>`).join('')}</tbody>
       </table></div>`;
+  }
+
+  // ---------- Race chart: cumulative points after each round ----------
+  const roundComplete = (r) => r.matches.length > 0 && r.matches.every((m) => m.done);
+  function byeCreditOf(r) {
+    const t = S.t;
+    if (t.scoring !== 'time') return Math.floor(t.points / 2);
+    const done = r.matches.filter((m) => m.done);
+    return done.length ? Math.round(done.reduce((s, m) => s + m.sa + m.sb, 0) / (done.length * 2)) : 0;
+  }
+  function raceSeries() {
+    const t = S.t;
+    const cum = {}; const series = {};
+    for (const p of t.players) { cum[p.id] = 0; series[p.id] = [0]; }
+    t.rounds.forEach((r) => {
+      if (!r.matches.some((m) => m.done)) return;
+      for (const m of r.matches) {
+        if (!m.done) continue;
+        for (const id of m.a) if (id in cum) cum[id] += m.sa;
+        for (const id of m.b) if (id in cum) cum[id] += m.sb;
+      }
+      if (t.byePoints && roundComplete(r)) { const c = byeCreditOf(r); for (const id of r.byes || []) if (id in cum) cum[id] += c; }
+      for (const id in cum) series[id].push(cum[id]);
+    });
+    return series;
+  }
+  const RACE_COLOURS = ['#e4ff3c', '#3cc8ff', '#ff6b4a', '#39e58c', '#c08bff'];
+  function raceHTML() {
+    const series = raceSeries();
+    const top = S.standings.filter((s) => s.played).slice(0, 5);
+    const n = series[top[0]?.id]?.length || 0;
+    if (top.length < 2 || n < 3) return '';
+    const max = Math.max(1, ...top.map((s) => series[s.id][n - 1]));
+    const narrow = innerWidth < 600;
+    const W = narrow ? 360 : 640, H = narrow ? 240 : 260, L = 30, R = narrow ? 74 : 96, T = 14, B = 26;
+    const x = (i) => L + (i / (n - 1)) * (W - L - R);
+    const y = (v) => T + (1 - v / max) * (H - T - B);
+    const pl = P();
+    // Nudge end labels apart so they don't overlap.
+    const ends = top.map((s, i) => ({ i, y: y(series[s.id][n - 1]) })).sort((a, b) => a.y - b.y);
+    for (let k = 1; k < ends.length; k++) if (ends[k].y - ends[k - 1].y < 18) ends[k].y = ends[k - 1].y + 18;
+    const endY = Object.fromEntries(ends.map((e) => [e.i, e.y]));
+    const grid = [0, 0.5, 1].map((f) => `<line x1="${L}" x2="${W - R}" y1="${y(max * f)}" y2="${y(max * f)}" class="gl"/><text x="${L - 6}" y="${y(max * f) + 4}" class="ax" text-anchor="end">${Math.round(max * f)}</text>`).join('');
+    const xs = Array.from({ length: n - 1 }, (_, i) => `<text x="${x(i + 1)}" y="${H - 6}" class="ax" text-anchor="middle">R${i + 1}</text>`).join('');
+    const lines = top.map((s, i) => {
+      const pts = series[s.id].map((v, k) => `${x(k).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
+      const c = RACE_COLOURS[i];
+      return `<polyline points="${pts}" fill="none" stroke="${c}" stroke-width="${i === 0 ? 4 : 2.5}" stroke-linejoin="round" stroke-linecap="round" class="rl" pathLength="1" style="animation-delay:${i * 0.12}s"/>
+        <circle cx="${x(n - 1)}" cy="${y(series[s.id][n - 1])}" r="5" fill="${c}"/>
+        <text x="${x(n - 1) + 10}" y="${endY[i] + 4}" fill="${c}" class="lb">${esc((pl[s.id]?.name || s.name).slice(0, 10))}</text>`;
+    }).join('');
+    return `<div class="section-h"><h2>The race</h2><span class="aside">Points after each round</span></div>
+      <div class="card race"><svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Points race chart for the top ${top.length}">${grid}${xs}${lines}</svg></div>`;
+  }
+
+  // ---------- Player profile ----------
+  function openProfile(pid) {
+    const t = S.t;
+    const pl = P();
+    const p = pl[pid];
+    const s = ST()[pid];
+    if (!p) return;
+    const games = [];
+    const mates = {}; const opps = {};
+    t.rounds.forEach((r) => {
+      for (const m of r.matches) {
+        const side = m.a.includes(pid) ? 'a' : m.b.includes(pid) ? 'b' : null;
+        if (!side) continue;
+        const us = side === 'a' ? m.a : m.b, them = side === 'a' ? m.b : m.a;
+        const mate = us.find((x) => x !== pid);
+        const f = m.done ? (side === 'a' ? m.sa : m.sb) : null, a = m.done ? (side === 'a' ? m.sb : m.sa) : null;
+        games.push({ r: r.n, court: m.court, mate, them, f, a, done: m.done });
+        if (!m.done) continue;
+        const mm = mates[mate] || (mates[mate] = { id: mate, g: 0, w: 0, diff: 0 });
+        mm.g++; mm.diff += f - a; if (f > a) mm.w++;
+        for (const o of them) { const oo = opps[o] || (opps[o] = { id: o, g: 0, l: 0, diff: 0 }); oo.g++; oo.diff += a - f; if (f < a) oo.l++; }
+      }
+      if ((r.byes || []).includes(pid)) games.push({ r: r.n, bye: true });
+    });
+    const best = Object.values(mates).sort((a, b) => b.diff - a.diff)[0];
+    const nem = Object.values(opps).filter((o) => o.l > 0).sort((a, b) => b.l - a.l || b.diff - a.diff)[0];
+    const series = raceSeries()[pid] || [];
+    const spark = series.length > 2 ? (() => {
+      const mx = Math.max(1, ...series), W = 280, H = 56;
+      const pts = series.map((v, i) => `${((i / (series.length - 1)) * W).toFixed(1)},${(H - 4 - (v / mx) * (H - 8)).toFixed(1)}`).join(' ');
+      return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true"><polyline points="${pts}" fill="none" stroke="var(--ball)" stroke-width="3" stroke-linejoin="round" vector-effect="non-scaling-stroke"/></svg>`;
+    })() : '';
+    const chip = (id) => `<span class="chip">${img(pl[id], '')}${esc(pl[id]?.name || '?')}</span>`;
+    const badges = (S.stats.awards || []).filter((a) => a.ids.includes(pid)).map((a) => `<span class="tag hot">${a.icon} ${esc(a.title)}</span>`).join('');
+    openModal(`<div class="profile">
+        <div class="pf-top"><span class="av-ring ${s?.streak >= 3 ? 'hot' : ''}"><img class="av xl" src="${photo(p)}" alt=""></span>
+          <div class="grow"><div class="pf-rank">${s?.played ? `#${s.rank} of ${S.standings.filter((x) => x.played).length}` : 'Yet to play'}</div><h3>${esc(p.name)}</h3><div class="pf-tags">${streakTag(s)}${badges}</div></div>
+          <button class="x-close" data-act="close-modal" aria-label="Close">×</button></div>
+        ${s?.played ? `<div class="pf-chips">
+          <div><b>${s.points}</b><span>Points</span></div><div><b>${s.w}-${s.d}-${s.l}</b><span>W-D-L</span></div>
+          <div><b>${s.winPct}%</b><span>Win rate</span></div><div><b>${s.diff > 0 ? '+' : ''}${s.diff}</b><span>+/−</span></div></div>` : ''}
+        ${spark}
+        ${best || nem ? `<div class="pf-duo">${best ? `<div><span class="muted tiny">Best partner 🤝</span>${chip(best.id)}<span class="tiny">${best.diff > 0 ? '+' : ''}${best.diff} together</span></div>` : ''}
+          ${nem ? `<div><span class="muted tiny">Nemesis 😈</span>${chip(nem.id)}<span class="tiny">won ${nem.l} of ${nem.g} against ${esc(p.name)}</span></div>` : ''}</div>` : ''}
+        <div class="pf-h">Match by match</div>
+        <div class="pf-games">${games.length ? games.map((g) => g.bye
+          ? `<div class="pg bye"><span class="r">R${g.r}</span><span class="grow muted">☕ Sat out</span></div>`
+          : `<div class="pg ${g.done ? (g.f > g.a ? 'w' : g.f < g.a ? 'l' : 'd') : ''}"><span class="r">R${g.r}</span>
+              <span class="grow">w/ ${esc(pl[g.mate]?.name || '?')} <span class="muted">vs ${g.them.map((x) => esc(pl[x]?.name || '?')).join(' & ')}</span></span>
+              <b>${g.done ? `${g.f}–${g.a}` : 'Live'}</b></div>`).join('') : '<div class="muted">No matches yet.</div>'}</div>
+      </div>`);
+  }
+
+  // ---------- Share image ----------
+  function loadImg(src) {
+    return new Promise((ok) => { const i = new Image(); i.onload = () => ok(i); i.onerror = () => ok(null); i.src = src; });
+  }
+  async function shareResults() {
+    const t = S.t;
+    const pl = P();
+    const top = S.standings.filter((s) => s.played).slice(0, 7);
+    if (!top.length) return toast('No results to share yet', true);
+    toast('Making your image…');
+    try { await document.fonts.ready; } catch { /* ignore */ }
+    const W = 1080, H = 1350;
+    const c = document.createElement('canvas'); c.width = W; c.height = H;
+    const g = c.getContext('2d');
+    const bg = g.createLinearGradient(0, 0, W, H); bg.addColorStop(0, '#0b1020'); bg.addColorStop(1, '#141c38');
+    g.fillStyle = bg; g.fillRect(0, 0, W, H);
+    g.fillStyle = 'rgba(228,255,60,.08)'; g.beginPath(); g.arc(W - 120, 140, 320, 0, Math.PI * 2); g.fill();
+    const head = (sz) => `900 ${sz}px "Big Shoulders Display", Impact, sans-serif`;
+    const fit = (txt, max) => { let s = txt; while (s.length > 1 && g.measureText(s).width > max) s = s.slice(0, -1); return s === txt ? s : s.slice(0, -1) + '…'; };
+    g.fillStyle = '#e4ff3c'; g.font = head(34); g.fillText('ULTIMATE PADDLE TOURNAMENT', 70, 100);
+    g.fillStyle = '#fff'; g.font = head(84); g.fillText(fit(t.name.toUpperCase(), W - 140), 70, 190);
+    g.fillStyle = 'rgba(255,255,255,.6)'; g.font = '500 30px Inter, sans-serif';
+    g.fillText(fit(`${fmtLabel(t)} · ${ptsLabel(t)}${t.date ? ' · ' + fmtDate(t.date) : ''}${t.venue ? ' · ' + t.venue : ''}`, W - 140), 70, 240);
+    const circle = async (p, x, y, r, ring) => {
+      const im = p && await loadImg(photo(p));
+      g.save(); g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); g.closePath(); g.clip();
+      if (im) g.drawImage(im, x - r, y - r, r * 2, r * 2); else { g.fillStyle = '#334'; g.fillRect(x - r, y - r, r * 2, r * 2); }
+      g.restore();
+      if (ring) { g.lineWidth = 8; g.strokeStyle = ring; g.beginPath(); g.arc(x, y, r + 4, 0, Math.PI * 2); g.stroke(); }
+    };
+    const champ = top[0];
+    await circle(pl[champ.id], 230, 480, 150, '#e4ff3c');
+    g.font = '90px serif'; g.fillText('👑', 180, 335);
+    g.fillStyle = '#e4ff3c'; g.font = head(40); g.fillText('CHAMPION', 430, 410);
+    g.fillStyle = '#fff'; g.font = head(110); g.fillText(fit(champ.name.toUpperCase(), W - 500), 430, 515);
+    g.fillStyle = 'rgba(255,255,255,.7)'; g.font = '600 34px Inter, sans-serif';
+    g.fillText(`${champ.points} pts · ${champ.w}W ${champ.l}L · ${champ.diff > 0 ? '+' : ''}${champ.diff}`, 430, 570);
+    let y0 = 730;
+    for (const s of top.slice(1)) {
+      const medal = s.rank === 2 ? '#c9d3e6' : s.rank === 3 ? '#e0a46a' : null;
+      g.fillStyle = 'rgba(255,255,255,.05)'; g.beginPath(); (g.roundRect ? g.roundRect(60, y0 - 45, W - 120, 82, 20) : g.rect(60, y0 - 45, W - 120, 82)); g.fill();
+      g.fillStyle = medal || 'rgba(255,255,255,.5)'; g.font = head(44); g.fillText(String(s.rank), 90, y0 + 14);
+      await circle(pl[s.id], 190, y0 - 4, 32, medal);
+      g.fillStyle = '#fff'; g.font = '700 36px Inter, sans-serif'; g.fillText(fit(s.name, 560) + (s.streak >= 3 ? ' 🔥' : ''), 245, y0 + 9);
+      g.textAlign = 'right'; g.fillStyle = '#e4ff3c'; g.font = head(48); g.fillText(String(s.points), W - 90, y0 + 14); g.textAlign = 'left';
+      y0 += 96;
+    }
+    const aw = (S.stats.awards || []).slice(0, 3).map((a) => `${a.icon} ${a.title}: ${a.names.join(' & ')}`).join('   ');
+    g.fillStyle = 'rgba(255,255,255,.55)'; g.font = '500 24px Inter, sans-serif'; g.fillText(fit(aw, W - 140), 70, H - 60);
+    const blob = await new Promise((ok) => c.toBlob(ok, 'image/png'));
+    const file = new File([blob], `${t.name.replace(/[^\w]+/g, '-').toLowerCase() || 'results'}.png`, { type: 'image/png' });
+    if (navigator.canShare?.({ files: [file] })) {
+      try { await navigator.share({ files: [file], title: t.name, text: `${champ.name} wins ${t.name} 🏆🎾` }); return; } catch (e) { if (e.name === 'AbortError') return; }
+    }
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = file.name; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 4000);
+    toast('Saved the results image 📸');
+  }
+
+  // ---------- Live tapping (optimistic, queued so taps land in order) ----------
+  let liveChain = Promise.resolve();
+  function findMatch(mid) { return S.t.rounds.flatMap((r) => r.matches).find((m) => m.id === mid); }
+  function livePoint(mid, side, d) {
+    const m = findMatch(mid);
+    if (!m || m.done) return;
+    const k = side === 'a' ? 'la' : 'lb';
+    m.la = m.la || 0; m.lb = m.lb || 0; m.seq = m.seq || '';
+    if (d > 0) {
+      if (S.t.scoring === 'points' && m.la + m.lb >= S.t.points) return;
+      m[k]++; m.seq += side;
+    } else {
+      if (!m[k]) return;
+      m[k]--; const i = m.seq.lastIndexOf(side); if (i >= 0) m.seq = m.seq.slice(0, i) + m.seq.slice(i + 1);
+    }
+    buzz(d > 0 ? 15 : [8, 30, 8]);
+    sfx('pt');
+    ui.pending = (ui.pending || 0) + 1;
+    render();
+    const el = document.querySelector(`[data-mscore="${mid}"]`);
+    if (el) { el.classList.remove('bump'); void el.offsetWidth; el.classList.add('bump'); }
+    const tid = S.t.id;
+    liveChain = liveChain
+      .then(() => api('PATCH', `/api/t/${tid}/matches/${mid}/live`, { side, d }))
+      .catch((err) => { toast(err.message, true); })
+      .finally(() => { ui.pending--; if (!ui.pending) poll(); });
   }
 
   // ---------- Podium ----------
@@ -598,6 +1027,7 @@
         <div class="block">${place}</div></div>` : '<div></div>';
     return `<h2 class="champ-title">Champion<br><em>${esc(top[0].name)}</em></h2>
       <div class="podium">${slot(top[1], 'second', 2)}${slot(top[0], 'first', 1)}${slot(top[2], 'third', 3)}</div>
+      ${route.view === 'tv' ? '' : '<div class="row" style="justify-content:center;margin:18px 0 6px"><button class="btn primary" data-act="share-img">📸 Share the results</button></div>'}
       <div class="section-h"><h2>Final ladder</h2></div>${ladderHTML()}`;
   }
 
@@ -615,7 +1045,7 @@
       body = `<div class="tv-body"><div>${podiumHTML().split('<div class="section-h">')[0]}</div><div><div class="section-h"><h2>Final ladder</h2></div>${ladderHTML(12)}</div></div>`;
     } else {
       body = `<div class="tv-body">
-        <div><div class="round-h"><h2>Round <span>${last.n}</span></h2></div><div class="courts">${last.matches.map((m) => courtHTML(m, false)).join('')}</div>
+        <div><div class="round-h"><h2>Round <span>${last.n}</span></h2></div><div class="courts">${last.matches.map((m) => courtHTML(m, false, 0, { tv: true })).join('')}</div>
           ${(last.byes || []).length ? `<div class="byes">☕ Sitting out: ${last.byes.map((id) => P()[id]).filter(Boolean).map((p) => `<span class="pill"><img src="${photo(p)}" alt="">${esc(p.name)}</span>`).join('')}</div>` : ''}
           <div class="section-h"><h2>Awards</h2></div>${awardsHTML()}</div>
         <div><div class="section-h"><h2>Live ladder</h2></div>${ladderHTML(14)}</div>
@@ -634,7 +1064,7 @@
     splashRoot.innerHTML = `<div class="splash" data-act="close-splash"><div class="splash-in">
       <div class="small">Here we go</div>
       <div class="big">Round ${r.n}</div>
-      <div class="courts">${r.matches.map((m, i) => courtHTML(m, false, i)).join('')}</div>
+      <div class="courts">${r.matches.map((m, i) => courtHTML(m, false, i, { noPicks: true })).join('')}</div>
       <div class="tap">Tap anywhere to close</div>
     </div></div>`;
     clearTimeout(showSplash.t);
@@ -844,8 +1274,13 @@
   });
 
   document.addEventListener('click', async (e) => {
-    const el = e.target.closest('[data-act], [data-tab]');
+    const el = e.target.closest('[data-act], [data-tab], [data-profile]');
     if (!el) return;
+    if (!el.dataset.act && !el.dataset.tab && el.dataset.profile) {
+      if (el.closest('.splash')) { splashRoot.innerHTML = ''; return; }
+      buzz(6); openProfile(el.dataset.profile);
+      return;
+    }
     if (el.dataset.tab) {
       ui.tab = el.dataset.tab; ui.viewRound = null; render(); window.scrollTo({ top: $('#r-tabs')?.offsetTop - 4 || 0, behavior: 'smooth' });
       return;
@@ -857,6 +1292,37 @@
       switch (act) {
         case 'close-bg': if (e.target === el) closeModal(); break;
         case 'close-splash': splashRoot.innerHTML = ''; break;
+        case 'close-modal': closeModal(); break;
+        case 'mute': if (muted()) { LS.del('upt:mute'); sfx('pt'); toast('Sound on 🔊'); } else { LS.set('upt:mute', 1); toast('Sound off 🔇'); } app.__html = null; $('#r-top') && ($('#r-top').__html = null); render(); break;
+        case 'react': sendReact(el.dataset.e); break;
+        case 'pt': livePoint(el.dataset.mid, el.dataset.side, 1); break;
+        case 'unpt': { const m = findMatch(el.dataset.mid); const last = (m?.seq || '').slice(-1) || ((m?.la || 0) >= (m?.lb || 0) ? 'a' : 'b'); livePoint(el.dataset.mid, last, -1); break; }
+        case 'confirm': {
+          el.disabled = true;
+          await liveChain;
+          const m = findMatch(el.dataset.mid);
+          await api('PUT', `/api/t/${t.id}/matches/${m.id}`, { sa: m.la || 0, sb: m.lb || 0 });
+          const pl = P();
+          const w = m.la > m.lb ? m.a : m.lb > m.la ? m.b : [];
+          toast(w.length ? `${w.map((id) => pl[id]?.name).join(' & ')} take it 💪` : 'All square 🤝');
+          buzz([20, 40, 60]);
+          await poll();
+          break;
+        }
+        case 'pick': {
+          const m = findMatch(el.dataset.mid);
+          const side = el.dataset.side;
+          const picks = myPicks();
+          if (!m || picks[m.id] === side) break;
+          m.picks = m.picks || { a: 0, b: 0 };
+          if (picks[m.id]) m.picks[picks[m.id]] = Math.max(0, m.picks[picks[m.id]] - 1);
+          m.picks[side]++;
+          picks[m.id] = side; LS.set('upt:picks:' + t.id, picks);
+          buzz(10); render();
+          await api('POST', `/api/t/${t.id}/matches/${m.id}/pick`, { side, voter: voterId() });
+          break;
+        }
+        case 'share-img': await shareResults(); break;
         case 'unlock': openPin(); break;
         case 'lock': if (confirm('Turn off organiser mode on this device?')) { LS.del(adminKey(t.id)); render(); } break;
         case 'join': {

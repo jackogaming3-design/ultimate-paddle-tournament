@@ -1,0 +1,14 @@
+{
+  "name": "Ultimate Paddle Tournament",
+  "short_name": "Paddle",
+  "description": "Americano and Mexicano padel with a live ladder, hot streaks and stats.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#07090d",
+  "theme_color": "#07090d",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}

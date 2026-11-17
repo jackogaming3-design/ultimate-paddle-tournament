@@ -36,6 +36,23 @@ function baseUrl(req) {
   return process.env.PUBLIC_URL?.replace(/\/$/, '') || `${req.protocol}://${req.get('host')}`;
 }
 
+// ---------- live hub (Server-Sent Events) ----------
+const hub = new Map(); // id -> Set(res)
+function broadcast(id, msg) {
+  const set = hub.get(id);
+  if (!set) return;
+  const line = `data: ${JSON.stringify(msg)}\n\n`;
+  for (const res of set) res.write(line);
+}
+function watchers(id) {
+  broadcast(id, { t: 'w', n: hub.get(id)?.size || 0 });
+}
+async function mut(id, fn) {
+  const out = await store.mutate(id, fn);
+  broadcast(id, { t: 'v', v: out.version });
+  return out;
+}
+
 const computed = new Map(); // id -> { version, payload }
 function publicState(id, rec) {
   const hit = computed.get(id);
@@ -51,7 +68,13 @@ function publicState(id, rec) {
       byePoints: doc.byePoints, status: doc.status, createdAt: doc.createdAt,
       startedAt: doc.startedAt, finishedAt: doc.finishedAt,
       players: doc.players.map((p) => ({ id: p.id, name: p.name, photoV: p.photoV, active: p.active !== false, joinedAt: p.joinedAt })),
-      rounds: doc.rounds,
+      rounds: doc.rounds.map((r) => ({
+        ...r,
+        matches: r.matches.map(({ picks, ...m }) => {
+          const v = Object.values(picks || {});
+          return { ...m, picks: { a: v.filter((x) => x === 'a').length, b: v.filter((x) => x === 'b').length } };
+        }),
+      })),
     },
     standings: table,
     stats: E.stats(doc, table),
@@ -148,7 +171,7 @@ app.post('/api/t/:id/join', wrap(async (req, res) => {
   const pid = E.code(10);
   const playerToken = E.token();
   await store.putPhoto(pid, rec.doc.id, photo.mime, photo.buf);
-  const out = await store.mutate(rec.doc.id, (doc) => {
+  const out = await mut(rec.doc.id, (doc) => {
     if (doc.players.some((p) => p.name.toLowerCase() === name.toLowerCase())) throw bad(409, `${name} is already in. Add a surname initial?`);
     const p = { id: pid, name, photoV: Date.now(), active: true, joinedAt: Date.now(), tokenHash: crypto.createHash('sha256').update(playerToken).digest('hex') };
     doc.players.push(p);
@@ -168,7 +191,7 @@ app.patch('/api/t/:id/players/:pid', wrap(async (req, res) => {
     const photo = parsePhoto(req.body.photo);
     await store.putPhoto(p.id, rec.doc.id, photo.mime, photo.buf);
   }
-  await store.mutate(rec.doc.id, (doc) => {
+  await mut(rec.doc.id, (doc) => {
     const q = doc.players.find((x) => x.id === p.id);
     if (req.body?.name) {
       const name = clean(req.body.name, 24);
@@ -183,7 +206,7 @@ app.patch('/api/t/:id/players/:pid', wrap(async (req, res) => {
 
 app.delete('/api/t/:id/players/:pid', wrap(async (req, res) => {
   const rec = await requireAdmin(req);
-  await store.mutate(rec.doc.id, (doc) => {
+  await mut(rec.doc.id, (doc) => {
     const played = doc.rounds.some((r) => r.matches.some((m) => [...m.a, ...m.b].includes(req.params.pid)) || (r.byes || []).includes(req.params.pid));
     if (played) {
       const q = doc.players.find((x) => x.id === req.params.pid);
@@ -197,13 +220,13 @@ app.delete('/api/t/:id/players/:pid', wrap(async (req, res) => {
 
 app.post('/api/t/:id/settings', wrap(async (req, res) => {
   const rec = await requireAdmin(req);
-  await store.mutate(rec.doc.id, (doc) => applySettings(doc, req.body || {}));
+  await mut(rec.doc.id, (doc) => applySettings(doc, req.body || {}));
   res.json({ ok: true });
 }));
 
 app.post('/api/t/:id/start', wrap(async (req, res) => {
   const rec = await requireAdmin(req);
-  await store.mutate(rec.doc.id, (doc) => {
+  await mut(rec.doc.id, (doc) => {
     if (doc.status !== 'lobby') throw bad(400, 'Already started');
     applySettings(doc, req.body || {});
     if (E.activePlayers(doc).length < 4) throw bad(400, 'Need at least 4 players');
@@ -216,7 +239,7 @@ app.post('/api/t/:id/start', wrap(async (req, res) => {
 
 app.post('/api/t/:id/next', wrap(async (req, res) => {
   const rec = await requireAdmin(req);
-  await store.mutate(rec.doc.id, (doc) => {
+  await mut(rec.doc.id, (doc) => {
     if (doc.status !== 'live') throw bad(400, 'Tournament is not live');
     const last = doc.rounds[doc.rounds.length - 1];
     if (last && !E.isRoundComplete(last)) throw bad(400, 'Finish scoring this round first');
@@ -228,7 +251,7 @@ app.post('/api/t/:id/next', wrap(async (req, res) => {
 
 app.post('/api/t/:id/reshuffle', wrap(async (req, res) => {
   const rec = await requireAdmin(req);
-  await store.mutate(rec.doc.id, (doc) => {
+  await mut(rec.doc.id, (doc) => {
     const last = doc.rounds[doc.rounds.length - 1];
     if (!last || doc.status !== 'live') throw bad(400, 'No round to reshuffle');
     if (last.matches.some((m) => m.done)) throw bad(400, 'Scores are already in for this round');
@@ -240,21 +263,22 @@ app.post('/api/t/:id/reshuffle', wrap(async (req, res) => {
 
 app.put('/api/t/:id/matches/:mid', wrap(async (req, res) => {
   const rec = await requireAdmin(req);
-  await store.mutate(rec.doc.id, (doc) => {
+  await mut(rec.doc.id, (doc) => {
     const m = doc.rounds.flatMap((r) => r.matches).find((x) => x.id === req.params.mid);
     if (!m) throw bad(404, 'Match not found');
-    if (req.body?.clear) { m.sa = null; m.sb = null; m.done = false; return; }
+    if (req.body?.clear) { m.sa = null; m.sb = null; m.done = false; m.la = 0; m.lb = 0; m.seq = ''; return; }
     const sa = parseInt(req.body?.sa, 10), sb = parseInt(req.body?.sb, 10);
     if (!Number.isInteger(sa) || !Number.isInteger(sb) || sa < 0 || sb < 0 || sa > 999 || sb > 999) throw bad(400, 'Scores must be numbers');
     if (doc.scoring === 'points' && sa + sb !== doc.points) throw bad(400, `Scores must add up to ${doc.points}`);
     m.sa = sa; m.sb = sb; m.done = true; m.at = Date.now();
+    if ((m.la || 0) + (m.lb || 0) === 0 || m.la !== sa || m.lb !== sb) { m.la = sa; m.lb = sb; }
   });
   res.json({ ok: true });
 }));
 
 app.post('/api/t/:id/finish', wrap(async (req, res) => {
   const rec = await requireAdmin(req);
-  await store.mutate(rec.doc.id, (doc) => {
+  await mut(rec.doc.id, (doc) => {
     // Drop an unplayed final round so it doesn't hang around.
     const last = doc.rounds[doc.rounds.length - 1];
     if (last && !last.matches.some((m) => m.done)) doc.rounds.pop();
@@ -266,8 +290,90 @@ app.post('/api/t/:id/finish', wrap(async (req, res) => {
 
 app.post('/api/t/:id/reopen', wrap(async (req, res) => {
   const rec = await requireAdmin(req);
-  await store.mutate(rec.doc.id, (doc) => { doc.status = doc.rounds.length ? 'live' : 'lobby'; doc.finishedAt = null; });
+  await mut(rec.doc.id, (doc) => { doc.status = doc.rounds.length ? 'live' : 'lobby'; doc.finishedAt = null; });
   res.json({ ok: true });
+}));
+
+// Point-by-point live scoring (organiser taps the team that won the point).
+app.patch('/api/t/:id/matches/:mid/live', wrap(async (req, res) => {
+  const rec = await requireAdmin(req);
+  const side = req.body?.side === 'b' ? 'b' : 'a';
+  const d = Number(req.body?.d) < 0 ? -1 : 1;
+  await mut(rec.doc.id, (doc) => {
+    const m = doc.rounds.flatMap((r) => r.matches).find((x) => x.id === req.params.mid);
+    if (!m) throw bad(404, 'Match not found');
+    if (m.done) throw bad(400, 'Match is already final. Edit the score instead.');
+    const k = side === 'a' ? 'la' : 'lb';
+    m.la = m.la || 0; m.lb = m.lb || 0; m.seq = m.seq || '';
+    if (d > 0) {
+      if (doc.scoring === 'points' && m.la + m.lb >= doc.points) throw bad(400, 'All points played. Confirm the score.');
+      m[k] += 1; m.seq = (m.seq + side).slice(-80);
+    } else if (m[k] > 0) {
+      m[k] -= 1;
+      const i = m.seq.lastIndexOf(side);
+      if (i >= 0) m.seq = m.seq.slice(0, i) + m.seq.slice(i + 1);
+    }
+    m.liveAt = Date.now();
+  });
+  res.json({ ok: true });
+}));
+
+// Crowd picks: anyone can back a team before the first point.
+app.post('/api/t/:id/matches/:mid/pick', wrap(async (req, res) => {
+  const rec = await load(req.params.id);
+  const side = req.body?.side === 'b' ? 'b' : 'a';
+  const tok = req.get('x-player-token') || '';
+  const th = tok && crypto.createHash('sha256').update(tok).digest('hex');
+  const pl = th && rec.doc.players.find((p) => p.tokenHash === th);
+  const dev = String(req.body?.voter || '');
+  if (!pl && !/^[\w-]{8,40}$/.test(dev)) throw bad(400, 'Missing voter');
+  const key = pl ? 'p:' + pl.id : 'd:' + dev;
+  await mut(rec.doc.id, (doc) => {
+    const m = doc.rounds.flatMap((r) => r.matches).find((x) => x.id === req.params.mid);
+    if (!m) throw bad(404, 'Match not found');
+    if (m.done || (m.la || 0) + (m.lb || 0) > 0) throw bad(400, 'Picks are locked once the match starts');
+    m.picks = m.picks || {};
+    if (Object.keys(m.picks).length > 300) throw bad(400, 'Too many picks');
+    m.picks[key] = side;
+  });
+  res.json({ ok: true });
+}));
+
+// Emoji reactions: not stored, just fired out to everyone watching.
+const REACTS = ['🔥', '👏', '😂', '😱', '💪', '🎾', '🫡', '💀', '🥶', '🐐'];
+const lastReact = new Map();
+app.post('/api/t/:id/react', wrap(async (req, res) => {
+  const rec = await load(req.params.id);
+  const e = String(req.body?.e || '');
+  if (!REACTS.includes(e)) throw bad(400, 'Unknown reaction');
+  const key = req.ip + req.params.id;
+  const now = Date.now();
+  if (now - (lastReact.get(key) || 0) < 250) return res.status(429).json({ error: 'Easy tiger' });
+  lastReact.set(key, now);
+  if (lastReact.size > 5000) lastReact.clear();
+  const tok = req.get('x-player-token') || '';
+  const th = tok && crypto.createHash('sha256').update(tok).digest('hex');
+  const pl = th && rec.doc.players.find((p) => p.tokenHash === th);
+  broadcast(rec.doc.id, { t: 'r', e, n: pl ? pl.name : '', pid: pl ? pl.id : '', mid: clean(req.body?.mid, 12) });
+  res.json({ ok: true });
+}));
+
+// Live stream: tells every open screen the moment anything changes.
+app.get('/api/t/:id/stream', wrap(async (req, res) => {
+  const rec = await load(req.params.id);
+  const id = rec.doc.id;
+  res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+  res.flushHeaders();
+  res.write(`retry: 3000\ndata: ${JSON.stringify({ t: 'v', v: rec.version })}\n\n`);
+  if (!hub.has(id)) hub.set(id, new Set());
+  hub.get(id).add(res);
+  watchers(id);
+  const hb = setInterval(() => res.write(': ping\n\n'), 20000);
+  req.on('close', () => {
+    clearInterval(hb);
+    hub.get(id)?.delete(res);
+    if (!hub.get(id)?.size) hub.delete(id); else watchers(id);
+  });
 }));
 
 app.get('/api/photo/:pid', wrap(async (req, res) => {
