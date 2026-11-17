@@ -24,7 +24,8 @@ npm test           # scheduler fairness checks
 
 ## Put it online (free): GitHub + Supabase + Render
 1. **Supabase** (database): supabase.com → New project. Then **Connect** → **Session pooler** → copy the URI and put your DB password in it. It looks like
-   `postgresql://postgres.xxxx:PASSWORD@aws-0-ap-southeast-2.pooler.supabase.com:5432/postgres`
+   `postgresql://postgres.xxxx:PASSWORD@aws-0-ap-southeast-1.pooler.supabase.com:5432/postgres`
+   (Pick Singapore for the Supabase project so it sits next to the Render server.)
    (Use the session pooler, not the direct connection: Render's free tier is IPv4 only.)
 2. **GitHub**: push this folder to a new repo.
 3. **Render**: New → **Blueprint** → pick the repo → Apply. Paste the Supabase URI into `DATABASE_URL` when asked. Tables are created automatically on first boot.

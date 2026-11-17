@@ -5,6 +5,7 @@ services:
     name: ultimate-paddle-tournament
     runtime: node
     plan: free
+    region: singapore # same region as the Supabase database
     buildCommand: npm install
     startCommand: node src/server.js
     healthCheckPath: /healthz
